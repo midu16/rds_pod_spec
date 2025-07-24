@@ -3,12 +3,15 @@
 from kubernetes import client, config
 import argparse
 import sys
+from collections import defaultdict
 
 # RDS thresholds
 RDS_MAX_PODS = 15
 RDS_MAX_CONTAINERS = 30
 RDS_MAX_EXEC_PROBES = 9
 RDS_MAX_EXEC_PROBE_FREQUENCY = 10
+
+EXCLUDED_NAMESPACES = {"ocp", "acm"}
 
 def extract_probe_details(probe):
     probe_details = {
@@ -21,14 +24,12 @@ def extract_probe_details(probe):
         if hasattr(probe, '_exec') and probe._exec:
             probe_details['check'] = "exec"
             probe_details['command'] = ' '.join(probe._exec.command or [])
-
         elif probe.http_get:
             scheme = probe.http_get.scheme or "http"
             port = probe.http_get.port or ""
             path = probe.http_get.path or "/"
             probe_details['check'] = "httpGet"
             probe_details['command'] = f"{scheme}://:{port}{path}"
-
         elif probe.tcp_socket:
             probe_details['check'] = "tcpSocket"
             probe_details['command'] = str(probe.tcp_socket.port)
@@ -146,11 +147,40 @@ def summarize_configmaps_and_secrets(namespace):
     for s in sorted(secrets):
         print(f"- {s}")
 
+def summarize_probe_frequencies(namespace):
+    v1 = client.CoreV1Api()
+    pods = v1.list_namespaced_pod(namespace)
+    probe_rates = defaultdict(float)
+
+    for pod in pods.items:
+        for container in pod.spec.containers:
+            for probe in [container.liveness_probe, container.readiness_probe, container.startup_probe]:
+                if not probe:
+                    continue
+                typ = "exec" if probe._exec else "http" if probe.http_get else "tcp"
+                period = probe.period_seconds or 10
+                probe_rates[typ] += 1.0 / period
+
+    total_rate = sum(probe_rates.values())
+    print(f"\n[Probe Frequencies] for namespace: {namespace}")
+    for typ, rate in probe_rates.items():
+        print(f"- {typ.upper()}: {rate:.2f} probes/sec")
+    print(f"=> Total: {total_rate:.2f} probes/sec")
+
+def get_target_namespaces(args):
+    v1 = client.CoreV1Api()
+    if args.all_namespaces:
+        all_ns = v1.list_namespace()
+        return [ns.metadata.name for ns in all_ns.items if ns.metadata.name not in EXCLUDED_NAMESPACES]
+    else:
+        return [args.namespace]
+
 def main():
     parser = argparse.ArgumentParser(description="Query pod specs in a namespace and generate summaries.")
-    parser.add_argument("-n", "--namespace", required=True, help="Namespace to query")
+    parser.add_argument("-n", "--namespace", help="Namespace to query (ignored if --all-namespaces is set)")
+    parser.add_argument("--all-namespaces", action="store_true", help="Analyze all namespaces except ocp/acm")
     parser.add_argument("-o", "--output",
-                        choices=["pod_table_asciidoc", "probes_csv", "rds_analysis", "configmap_summary", "all"],
+                        choices=["pod_table_asciidoc", "probes_csv", "rds_analysis", "configmap_summary", "probe_freq", "all"],
                         default="all")
     args = parser.parse_args()
 
@@ -160,31 +190,38 @@ def main():
         config.load_incluster_config()
 
     try:
-        pods = get_pod_data(args.namespace)
+        namespaces = get_target_namespaces(args)
     except Exception as e:
-        print(f"[ERROR] Failed to get pod data: {e}", file=sys.stderr)
+        print(f"[ERROR] Failed to determine namespaces: {e}", file=sys.stderr)
         sys.exit(1)
 
-    try:
-        if args.output == "pod_table_asciidoc":
-            output_asciidoc(pods)
-        elif args.output == "probes_csv":
-            output_probes_csv(pods)
-        elif args.output == "rds_analysis":
-            output_rds_analysis(pods)
-        elif args.output == "configmap_summary":
-            summarize_configmaps_and_secrets(args.namespace)
-        elif args.output == "all":
-            output_asciidoc(pods)
-            print("\n---\n")
-            output_probes_csv(pods)
-            print("\n---\n")
-            output_rds_analysis(pods)
-            print("\n---\n")
-            summarize_configmaps_and_secrets(args.namespace)
-    except Exception as e:
-        print(f"[ERROR] Failed during output: {e}", file=sys.stderr)
-        sys.exit(2)
+    for ns in namespaces:
+        print(f"\n=== Namespace: {ns} ===")
+        try:
+            pods = get_pod_data(ns)
+
+            if args.output == "pod_table_asciidoc":
+                output_asciidoc(pods)
+            elif args.output == "probes_csv":
+                output_probes_csv(pods)
+            elif args.output == "rds_analysis":
+                output_rds_analysis(pods)
+            elif args.output == "configmap_summary":
+                summarize_configmaps_and_secrets(ns)
+            elif args.output == "probe_freq":
+                summarize_probe_frequencies(ns)
+            elif args.output == "all":
+                output_asciidoc(pods)
+                print("\n---\n")
+                output_probes_csv(pods)
+                print("\n---\n")
+                output_rds_analysis(pods)
+                print("\n---\n")
+                summarize_configmaps_and_secrets(ns)
+                print("\n---\n")
+                summarize_probe_frequencies(ns)
+        except Exception as e:
+            print(f"[ERROR] Failed to process namespace {ns}: {e}", file=sys.stderr)
 
 if __name__ == "__main__":
     main()
